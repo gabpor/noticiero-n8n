@@ -1,0 +1,180 @@
+{
+  "id": "NtcIngesta000001",
+  "name": "Noticiero · Ingesta RSS",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Madrid",
+    "saveManualExecutions": true
+  },
+  "nodes": [
+    {
+      "id": "i1",
+      "name": "Cada hora",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 * * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "i2",
+      "name": "Ejecutar a mano",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "i3",
+      "name": "Fuentes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// Fuentes RSS. Para añadir o quitar una, edita esta lista.\n// \"id\" es lo que se guarda en raw_news.source.\nconst fuentes = [\n  { id: 'ahead_of_ai',      url: 'https://magazine.sebastianraschka.com/feed' },\n  { id: 'import_ai',        url: 'https://importai.substack.com/feed' },\n  { id: 'latent_space',     url: 'https://www.latent.space/feed' },\n  { id: 'simon_willison',   url: 'https://simonwillison.net/atom/everything/' },\n  { id: 'one_useful_thing', url: 'https://www.oneusefulthing.org/feed' },\n  { id: 'openai_news',      url: 'https://openai.com/news/rss.xml' },\n  { id: 'n8n_releases',     url: 'https://github.com/n8n-io/n8n/releases.atom' },\n];\n// Solo feeds que traen texto: con el titular solo, la IA no tiene de dónde resumir.\nreturn fuentes.map(f => ({ json: f }));"
+      }
+    },
+    {
+      "id": "i4",
+      "name": "Leer feeds",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        480,
+        100
+      ],
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {}
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "i5",
+      "name": "Normalizar",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// Convierte cada entrada del feed en una fila de raw_news.\n// Solo entra lo publicado en los últimos DIAS días y con fecha: una noticia sin fecha\n// no se puede filtrar por periodo y no se guarda. Máximo MAX_POR_FUENTE por fuente.\nconst DIAS = 7;\nconst MAX_POR_FUENTE = 15;\nconst MAX_TEXTO = 1500;\n\nconst ahora = Date.now();\nconst desde = ahora - DIAS * 864e5;\nconst limpiar = (s) => String(s ?? '')\n  .replace(/<[^>]+>/g, ' ')\n  .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')\n  .replace(/&gt;/g, '>').replace(/&quot;/g, '\"').replace(/&#39;/g, \"'\")\n  .replace(/\\s+/g, ' ').trim();\n\nconst porFuente = {};\nconst vistas = new Set();\n\n$input.all().forEach((item, i) => {\n  const fuente = $('Fuentes').itemMatching(i).json.id;\n  const e = item.json;\n  if (e.error) return; // feed caído: se ignora y siguen los demás\n\n  const url = String(e.link || e.guid || '').trim();\n  if (!/^https?:\\/\\//.test(url) || vistas.has(url)) return;\n\n  const t = Date.parse(e.isoDate || e.pubDate || '');\n  if (Number.isNaN(t) || t < desde || t > ahora + 864e5) return;\n\n  const titulo = limpiar(e.title).slice(0, 500);\n  if (!titulo) return;\n\n  vistas.add(url);\n  (porFuente[fuente] ||= []).push({\n    title: titulo,\n    url,\n    source: fuente,\n    published_at: new Date(t).toISOString(),\n    raw_content: limpiar(e.contentSnippet || e.summary || e.content || '').slice(0, MAX_TEXTO),\n  });\n});\n\nreturn Object.values(porFuente)\n  .flatMap(filas => filas\n    .sort((a, b) => b.published_at.localeCompare(a.published_at))\n    .slice(0, MAX_POR_FUENTE))\n  .map(fila => ({ json: fila }));"
+      }
+    },
+    {
+      "id": "i6",
+      "name": "Guardar noticias",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        960,
+        100
+      ],
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public",
+          "cachedResultName": "public"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "list",
+          "value": "raw_news",
+          "cachedResultName": "raw_news"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {
+          "skipOnConflict": true
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "NtcPostgres00001",
+          "name": "Postgres noticiero"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Cada hora": {
+      "main": [
+        [
+          {
+            "node": "Fuentes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ejecutar a mano": {
+      "main": [
+        [
+          {
+            "node": "Fuentes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fuentes": {
+      "main": [
+        [
+          {
+            "node": "Leer feeds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer feeds": {
+      "main": [
+        [
+          {
+            "node": "Normalizar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar": {
+      "main": [
+        [
+          {
+            "node": "Guardar noticias",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

@@ -1,0 +1,434 @@
+{
+  "id": "NtcResumen000001",
+  "name": "Noticiero · Resumen a Telegram",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Madrid",
+    "saveManualExecutions": true
+  },
+  "nodes": [
+    {
+      "id": "r1",
+      "name": "Lunes y jueves 8:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * 1,4"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "r2",
+      "name": "Ejecutar a mano",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r3",
+      "name": "Configuración",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        240,
+        100
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c1",
+              "name": "canal",
+              "value": "@ia_al_grano",
+              "type": "string"
+            },
+            {
+              "id": "c2",
+              "name": "dias",
+              "value": 4,
+              "type": "number"
+            },
+            {
+              "id": "c3",
+              "name": "destacadas",
+              "value": 3,
+              "type": "number"
+            },
+            {
+              "id": "c6",
+              "name": "tambien",
+              "value": 5,
+              "type": "number"
+            },
+            {
+              "id": "c4",
+              "name": "modelo_gemini",
+              "value": "gemini-3.5-flash-lite",
+              "type": "string"
+            },
+            {
+              "id": "c5",
+              "name": "modelo_groq",
+              "value": "openai/gpt-oss-120b",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "r4",
+      "name": "Noticias recientes",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        480,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, title, url, source, published_at,\n       LEFT(COALESCE(raw_content, ''), 700) AS texto\nFROM raw_news\nWHERE published_at >= NOW() - make_interval(days => $1::int)\n  AND published_at <= NOW()\nORDER BY published_at DESC\nLIMIT 200;",
+        "options": {
+          "queryReplacement": "={{ $json.dias }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "NtcPostgres00001",
+          "name": "Postgres noticiero"
+        }
+      }
+    },
+    {
+      "id": "r5",
+      "name": "Preparar candidatas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// Deja una lista corta y variada de candidatas para la IA:\n// sin titulares repetidos y con un máximo por fuente para que ninguna lo acapare.\nconst cfg = $('Configuración').first().json;\nconst MAX_POR_FUENTE = 6;\nconst MIN_TEXTO = 80; // sin texto suficiente, la IA solo podría parafrasear el titular\n\nconst filas = $input.all().map(i => i.json).filter(r => r.url && r.title && (r.texto || '').length >= MIN_TEXTO);\nconst vistos = new Set();\nconst porFuente = {};\nconst candidatas = [];\n\nfor (const r of filas) {\n  const clave = r.title.toLowerCase().normalize('NFD').replace(/[^a-z0-9 ]/g, '').replace(/\\s+/g, ' ').trim().slice(0, 80);\n  if (vistos.has(clave)) continue;\n  vistos.add(clave);\n  porFuente[r.source] = (porFuente[r.source] || 0) + 1;\n  if (porFuente[r.source] > MAX_POR_FUENTE) continue;\n  candidatas.push({\n    n: candidatas.length + 1,\n    titulo: r.title,\n    url: r.url,\n    fuente: r.source,\n    fecha: new Date(r.published_at).toISOString(),\n    texto: r.texto || '',\n  });\n}\n\nif (candidatas.length === 0) return []; // nada nuevo en el periodo: no se envía nada\n\nconst instrucciones = [\n  `Eres el editor de un boletín en español sobre inteligencia artificial. Recibes noticias numeradas de los últimos ${cfg.dias} días.`,\n  'Criterio para elegir: lo más útil para quien construye con IA (lanzamientos, herramientas, técnicas, cambios que afectan al trabajo técnico). Descarta las que repiten tema, las notas de versión menores y el contenido promocional.',\n  'Devuelve:',\n  `- \"destacadas\": las ${cfg.destacadas} noticias más importantes, de más a menos. Para cada una:`,\n  '  - id: el número entre corchetes, exacto.',\n  '  - titulo: el titular en español, máximo 70 caracteres.',\n  '  - resumen: una o dos frases en español sobre qué ha pasado, usando solo lo que dice el texto. No añadas datos que no estén en el texto. Si usas cifras, cópialas tal como aparecen en el original.',\n  '  - por_que_importa: una frase para alguien que dirige un negocio o una pequeña empresa: qué le puede suponer en la práctica. Escríbela en forma impersonal (nunca «podrás» ni «puedes»). Solo lo que se deduce del texto: no prometas resultados; si el texto no permite deducir un efecto práctico, di a qué tipo de empresa le conviene seguir el tema. Sin tecnicismos y sin cifras que no estén en el texto.',\n  `- \"tambien\": entre 3 y ${cfg.tambien} noticias más, distintas de las destacadas, cada una con id y titulo (máximo 70 caracteres).`,\n  'Responde solo con JSON.',\n].join('\\n');\n\nconst lista = candidatas.map(c => `[${c.n}] (${c.fuente}) ${c.titulo}\\n${c.texto}`).join('\\n\\n');\n\nreturn [{ json: { candidatas, instrucciones, lista, fuentes: Object.keys(porFuente).length } }];"
+      }
+    },
+    {
+      "id": "r6",
+      "name": "Gemini redacta",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $('Configuración').first().json.modelo_gemini }}:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  systemInstruction: { parts: [{ text: $json.instrucciones }] },\n  contents: [{ role: 'user', parts: [{ text: $json.lista }] }],\n  generationConfig: {\n    temperature: 0.3,\n    responseMimeType: 'application/json',\n    responseSchema: {\n      type: 'OBJECT',\n      properties: {\n        destacadas: {\n          type: 'ARRAY',\n          items: {\n            type: 'OBJECT',\n            properties: {\n              id: { type: 'INTEGER' },\n              titulo: { type: 'STRING' },\n              resumen: { type: 'STRING' },\n              por_que_importa: { type: 'STRING' }\n            },\n            required: ['id', 'titulo', 'resumen', 'por_que_importa']\n          }\n        },\n        tambien: {\n          type: 'ARRAY',\n          items: {\n            type: 'OBJECT',\n            properties: { id: { type: 'INTEGER' }, titulo: { type: 'STRING' } },\n            required: ['id', 'titulo']\n          }\n        }\n      },\n      required: ['destacadas', 'tambien']\n    }\n  }\n}) }}",
+        "options": {
+          "timeout": 90000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "NtcGemini0000001",
+          "name": "Gemini API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "r7",
+      "name": "Leer Gemini",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Saca el JSON de la respuesta de Gemini. Si no hay JSON válido con noticias,\n// el error sale por la salida de error y el resumen lo redacta Groq.\nconst r = $input.first().json;\nconst texto = (r.candidates?.[0]?.content?.parts || [])\n  .filter(p => !p.thought)\n  .map(p => p.text || '')\n  .join('');\nconst datos = JSON.parse(texto);\nif (!Array.isArray(datos.destacadas) || datos.destacadas.length === 0) {\n  throw new Error('Gemini no devolvió noticias destacadas');\n}\nreturn [{ json: { ...datos, modelo: $('Configuración').first().json.modelo_gemini } }];"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "r8",
+      "name": "Groq redacta (reserva)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        260
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: $('Configuración').first().json.modelo_groq,\n  temperature: 0.3,\n  response_format: { type: 'json_object' },\n  messages: [\n    { role: 'system', content: $('Preparar candidatas').first().json.instrucciones + '\\n\\nFormato exacto: {\"destacadas\": [{\"id\": 1, \"titulo\": \"...\", \"resumen\": \"...\", \"por_que_importa\": \"...\"}], \"tambien\": [{\"id\": 2, \"titulo\": \"...\"}]}' },\n    { role: 'user', content: $('Preparar candidatas').first().json.lista }\n  ]\n}) }}",
+        "options": {
+          "timeout": 90000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "NtcGroq000000001",
+          "name": "Groq API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "r9",
+      "name": "Leer Groq",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        260
+      ],
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nconst datos = JSON.parse(r.choices?.[0]?.message?.content || '');\nif (!Array.isArray(datos.destacadas) || datos.destacadas.length === 0) {\n  throw new Error('Groq no devolvió noticias destacadas');\n}\nreturn [{ json: { ...datos, modelo: $('Configuración').first().json.modelo_groq } }];"
+      }
+    },
+    {
+      "id": "r10",
+      "name": "Validar y maquetar",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Comprueba lo que ha escrito la IA antes de enviarlo:\n// - el enlace, la fuente y la fecha no los escribe la IA: salen de la base de datos por el id;\n// - una noticia con una cifra que no aparece en su texto original se descarta.\n// Después monta el mensaje en HTML de Telegram: 3 destacadas y el resto en una línea.\nconst cfg = $('Configuración').first().json;\nconst prep = $('Preparar candidatas').first().json;\nconst datos = $input.first().json;\n\nconst NOMBRES = {\n  ahead_of_ai: 'Ahead of AI', import_ai: 'Import AI', latent_space: 'Latent Space',\n  simon_willison: 'Simon Willison', one_useful_thing: 'One Useful Thing',\n  openai_news: 'OpenAI', n8n_releases: 'n8n',\n};\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst attr = (s) => esc(s).replace(/\"/g, '&quot;');\n// \"15,000\", \"15.000\" y \"15 000\" cuentan como la misma cifra: se comparan solo los dígitos.\nconst cifras = (s) => (String(s ?? '').match(/\\d{1,3}(?:[   .,]\\d{3})+(?:[.,]\\d+)?|\\d+(?:[.,]\\d+)?/g) || [])\n  .map(n => n.replace(/\\D/g, ''));\nconst ddmm = (d) => `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}`;\nconst fuente = (c) => esc(NOMBRES[c.fuente] || c.fuente);\n\nconst porId = new Map(prep.candidatas.map(c => [c.n, c]));\nconst usadas = new Set();\nconst descartadas = [];\n\nfunction validar(lista, campos, maximo) {\n  const ok = [];\n  for (const n of lista || []) {\n    if (ok.length >= maximo) break;\n    const c = porId.get(Number(n.id));\n    if (!c) { descartadas.push({ id: n.id, motivo: 'id que no existe en la lista' }); continue; }\n    if (usadas.has(c.n)) continue;\n    if (campos.some(k => !n[k])) { descartadas.push({ id: c.n, motivo: 'faltan campos' }); continue; }\n    const originales = new Set(cifras(`${c.titulo} ${c.texto}`));\n    const inventadas = cifras(campos.map(k => n[k]).join(' ')).filter(x => !originales.has(x));\n    if (inventadas.length) {\n      descartadas.push({ id: c.n, url: c.url, motivo: `cifras que no están en el original: ${inventadas.join(', ')}` });\n      continue;\n    }\n    usadas.add(c.n);\n    ok.push({ c, n });\n  }\n  return ok;\n}\n\nconst destacadas = validar(datos.destacadas, ['titulo', 'resumen', 'por_que_importa'], cfg.destacadas);\nconst tambien = validar(datos.tambien, ['titulo'], cfg.tambien);\n\nif (destacadas.length === 0) {\n  throw new Error(`Ninguna noticia destacada pasó la validación: ${JSON.stringify(descartadas)}`);\n}\n\nconst hoy = new Date();\nconst modelo = String(datos.modelo).startsWith('gemini') ? 'Gemini' : 'gpt-oss en Groq';\n\nconst bloqueDestacada = ({ c, n }, i) => [\n  `<b>${i + 1}. ${esc(n.titulo)}</b>`,\n  esc(n.resumen),\n  `→ ${esc(n.por_que_importa)}`,\n  `<a href=\"${attr(c.url)}\">${fuente(c)} · ${ddmm(new Date(c.fecha))}</a>`,\n].join('\\n');\n\nconst lineaTambien = ({ c, n }) => `• <a href=\"${attr(c.url)}\">${esc(n.titulo)}</a> · ${fuente(c)}`;\n\nlet nTambien = tambien.length;\nlet html;\ndo {\n  const partes = [\n    `<b>Noticiero IA · ${ddmm(new Date(hoy - cfg.dias * 864e5))} – ${ddmm(hoy)}</b>`,\n    '<b>LO MÁS IMPORTANTE</b>',\n    ...destacadas.map(bloqueDestacada),\n  ];\n  if (nTambien > 0) partes.push(['<b>TAMBIÉN</b>', ...tambien.slice(0, nTambien).map(lineaTambien)].join('\\n'));\n  partes.push(`<i>${destacadas.length + nTambien} noticias · redactado con ${modelo}</i>`);\n  html = partes.join('\\n\\n');\n  if (html.length <= 4000) break;\n  nTambien--;\n} while (nTambien >= 0);\n\nreturn [{\n  json: {\n    digest_type: 'bisemanal',\n    content_html: html,\n    model: datos.modelo,\n    news_count: destacadas.length + Math.max(nTambien, 0),\n    discarded: JSON.stringify(descartadas),\n  },\n}];"
+      }
+    },
+    {
+      "id": "r11",
+      "name": "Guardar resumen",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2160,
+        0
+      ],
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public",
+          "cachedResultName": "public"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "list",
+          "value": "digests",
+          "cachedResultName": "digests"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "NtcPostgres00001",
+          "name": "Postgres noticiero"
+        }
+      }
+    },
+    {
+      "id": "r12",
+      "name": "Enviar al canal",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2400,
+        0
+      ],
+      "parameters": {
+        "chatId": "={{ $('Configuración').first().json.canal }}",
+        "text": "={{ $('Validar y maquetar').first().json.content_html }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "NtcTelegram00001",
+          "name": "Telegram bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Lunes y jueves 8:00": {
+      "main": [
+        [
+          {
+            "node": "Configuración",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ejecutar a mano": {
+      "main": [
+        [
+          {
+            "node": "Configuración",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Configuración": {
+      "main": [
+        [
+          {
+            "node": "Noticias recientes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Noticias recientes": {
+      "main": [
+        [
+          {
+            "node": "Preparar candidatas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar candidatas": {
+      "main": [
+        [
+          {
+            "node": "Gemini redacta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini redacta": {
+      "main": [
+        [
+          {
+            "node": "Leer Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Groq redacta (reserva)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer Gemini": {
+      "main": [
+        [
+          {
+            "node": "Validar y maquetar",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Groq redacta (reserva)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq redacta (reserva)": {
+      "main": [
+        [
+          {
+            "node": "Leer Groq",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer Groq": {
+      "main": [
+        [
+          {
+            "node": "Validar y maquetar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar y maquetar": {
+      "main": [
+        [
+          {
+            "node": "Guardar resumen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardar resumen": {
+      "main": [
+        [
+          {
+            "node": "Enviar al canal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
